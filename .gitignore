@@ -1,0 +1,8 @@
+__pycache__/
+.pycache_tmp/
+.streamlit/
+
+# local credentials
+service_account.json
+*.service-account.json
+black-practice-*-*.json
