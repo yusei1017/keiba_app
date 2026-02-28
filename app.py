@@ -3536,19 +3536,15 @@ if st.session_state.get("_run_output"):
                 raise ValueError("オッズURLを入力してください。")
 
             status = st.status("処理中…（ジニ係数算出）", expanded=False)
-            status.update(label="処理中…（URL取得）", state="running")
-            html = fetch_html(odds_url)
+            race_id = ""
+            try:
+                qs = parse_qs(urlparse(odds_url).query)
+                race_id = str(qs.get("race_id", [""])[0] or "")
+            except Exception:
+                race_id = ""
 
-            race_ctx = parse_race_context_from_html(odds_url, html)
-            race_id = str(race_ctx.get("race_id", "") or "")
-            if not race_id:
-                try:
-                    qs = parse_qs(urlparse(odds_url).query)
-                    race_id = str(qs.get("race_id", [""])[0] or "")
-                except Exception:
-                    race_id = ""
-
-            runner_count = parse_runner_count_from_result_html(html)
+            race_ctx: Dict[str, Any] = {"race_id": race_id, "date": "", "venue": "", "race_no": None}
+            runner_count: Optional[int] = None
             win_rows: List[Dict[str, Any]] = []
             if race_id:
                 try:
@@ -3557,12 +3553,39 @@ if st.session_state.get("_run_output"):
                 except Exception:
                     win_rows = []
 
-            if not win_rows:
-                win_map = parse_win_odds_from_html_generic(html)
-                win_rows = compute_win_odds_rows_from_map(win_map)
+            html = ""
+            if (not win_rows) or (not race_ctx.get("date") and not race_ctx.get("venue")):
+                try:
+                    status.update(label="処理中…（URL取得）", state="running")
+                    html = fetch_html(odds_url)
+                    race_ctx = parse_race_context_from_html(odds_url, html)
+                    if not race_id:
+                        race_id = str(race_ctx.get("race_id", "") or "")
+                    runner_count = parse_runner_count_from_result_html(html)
+                except Exception:
+                    html = ""
+
+            if not win_rows and race_id:
+                try:
+                    status.update(label=f"処理中…（単勝オッズ） race_id={race_id}", state="running")
+                    win_rows = fetch_win_rows_for_race(race_id)
+                except Exception:
+                    win_rows = []
 
             if not win_rows:
-                raise RuntimeError("単勝オッズを取得できませんでした。単勝オッズURLを入力してください。")
+                if html:
+                    win_map = parse_win_odds_from_html_generic(html)
+                    win_rows = compute_win_odds_rows_from_map(win_map)
+
+            if not win_rows:
+                raise RuntimeError(
+                    "単勝オッズを取得できませんでした。"
+                    "race_id を含むURLを入力し、時間を置いて再試行してください（403/429時は取得不可）。"
+                )
+
+            if race_id and not str(race_ctx.get("venue", "") or ""):
+                place_code = parse_place_code_from_race_id(race_id)
+                race_ctx["venue"] = place_name_from_code_any(place_code)
 
             cnt = count_valid_win_rows(win_rows)
             if runner_count is None and cnt is not None:
