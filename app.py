@@ -3468,11 +3468,18 @@ if ui_mode == "ジニ係数算出（オッズURL）":
 
 st.caption("レポート設定（Google Sheets）")
 sheets_enabled = st.checkbox("結果をGoogle Sheetsに記録", value=True)
+default_spreadsheet_id = str(
+    os.getenv("SHEETS_SPREADSHEET_ID", "1AdgLnjPhweDaVKB-QO1Sd4iXGozs2T_Nw2OBSNYmLEY") or ""
+).strip()
+spreadsheet_id_locked = bool(str(os.getenv("SHEETS_SPREADSHEET_ID", "") or "").strip())
+gini_target_sheet_name = str(os.getenv("GINI_TARGET_SHEET", "予想") or "").strip() or "予想"
 sheets_spreadsheet_id = st.text_input(
     "Spreadsheet ID",
-    value="1AdgLnjPhweDaVKB-QO1Sd4iXGozs2T_Nw2OBSNYmLEY",
-    disabled=(not sheets_enabled),
+    value=default_spreadsheet_id,
+    disabled=(not sheets_enabled) or spreadsheet_id_locked,
 )
+if spreadsheet_id_locked:
+    st.caption("Spreadsheet ID は環境変数 SHEETS_SPREADSHEET_ID で固定されています。")
 sheets_sheet_name = st.text_input("シート名（予想モード互換）", value="result", disabled=(not sheets_enabled))
 st.caption(
     "払戻→Sheetsの追記列: A=人気 / B=金額 / C=場所コード / D=ジニ係数 / E=出走頭数"
@@ -3642,7 +3649,7 @@ if st.session_state.get("_run_output"):
             col_g2.metric("出走頭数", str(int(gini_row["出走頭数"])))
             col_g3.metric("ジニ対象頭数", str(int(gini_row["ジニ対象頭数"])))
 
-            # 毎回上書きで「予想!B1:B5」を更新する
+            # 毎回上書きで「予想!B1:B5」（環境変数で変更可）を更新する
             can_write_pred = sheets_enabled and has_service_account_source(
                 sheets_sa_file, str(sheets_sa_path).strip()
             ) and bool(sheets_spreadsheet_id.strip())
@@ -3650,19 +3657,19 @@ if st.session_state.get("_run_output"):
                 st.info("予想シート更新には Spreadsheet ID とサービスアカウントJSONを指定してください。")
             if can_write_pred:
                 try:
-                    status.update(label="処理中…（Sheets更新: 予想!B1:B5）", state="running")
+                    status.update(label=f"処理中…（Sheets更新: {gini_target_sheet_name}!B1:B5）", state="running")
                     sa_info = load_service_account_info(
                         uploaded=sheets_sa_file, local_path=str(sheets_sa_path).strip()
                     )
                     google_sheets.ensure_sheet_exists(
                         spreadsheet_id=str(sheets_spreadsheet_id).strip(),
-                        sheet_name="予想",
+                        sheet_name=gini_target_sheet_name,
                         service_account_info=sa_info,
                     )
                     x = float(gini_row["ジニ係数"])
                     google_sheets.update_range(
                         spreadsheet_id=str(sheets_spreadsheet_id).strip(),
-                        sheet_name="予想",
+                        sheet_name=gini_target_sheet_name,
                         a1_range="B1:B5",
                         values=[
                             [float(x - 0.01)],
@@ -3673,7 +3680,10 @@ if st.session_state.get("_run_output"):
                         ],
                         service_account_info=sa_info,
                     )
-                    st.caption("予想シート更新: B1=x-0.01 / B2=x+0.01 / B3=馬場コード / B4=出走頭数 / B5=出走頭数")
+                    st.caption(
+                        f"{gini_target_sheet_name} シート更新: "
+                        "B1=x-0.01 / B2=x+0.01 / B3=馬場コード / B4=出走頭数 / B5=出走頭数"
+                    )
                 except google_sheets.GoogleSheetsUnavailable as e:
                     st.error(str(e))
                 except Exception as e:
