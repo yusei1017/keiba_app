@@ -213,6 +213,13 @@ def parse_race_context_from_html(url: str, html: str) -> Dict[str, Any]:
         race_id = str(qs.get("race_id", [""])[0] or "")
     except Exception:
         race_id = ""
+    if not race_id:
+        try:
+            m = re.search(r"/RACEID/([0-9]{8,20})", str(url or ""), flags=re.IGNORECASE)
+            if m:
+                race_id = str(m.group(1))
+        except Exception:
+            race_id = ""
 
     soup = BeautifulSoup(html, "html.parser")
     candidates: List[str] = []
@@ -310,6 +317,191 @@ def parse_race_context_from_html(url: str, html: str) -> Dict[str, Any]:
     return {"race_id": race_id, "date": date_str, "venue": venue, "race_no": race_no}
 
 
+def extract_race_id_from_any_url(url: str) -> str:
+    """
+    netkeiba / 楽天競馬URL から race_id / RACEID を抽出する。
+    """
+    u = str(url or "").strip()
+    if not u:
+        return ""
+
+    try:
+        qs = parse_qs(urlparse(u).query)
+        rid = str(qs.get("race_id", [""])[0] or qs.get("RACEID", [""])[0] or "").strip()
+        if rid:
+            return rid
+    except Exception:
+        pass
+
+    m = re.search(r"/RACEID/([0-9]{8,20})", u, flags=re.IGNORECASE)
+    if m:
+        return str(m.group(1))
+    return ""
+
+
+def is_rakuten_keiba_url(url: str) -> bool:
+    u = str(url or "").lower()
+    return "rakuten.co.jp" in u and "keiba" in u
+
+
+def _extract_rakuten_odds_map_from_obj(obj: Any, out: Dict[int, float]) -> None:
+    if isinstance(obj, dict):
+        horse_no: Optional[int] = None
+        for k in ("horseNo", "horseNumber", "horse_no", "number", "umaban", "馬番"):
+            n = parse_int_maybe(obj.get(k, ""))
+            if n is not None and 1 <= int(n) <= 30:
+                horse_no = int(n)
+                break
+
+        odds_val: Optional[float] = None
+        # 単勝系のキーを優先
+        for k in (
+            "winOdds",
+            "win_odds",
+            "singleOdds",
+            "single_odds",
+            "tanshoOdds",
+            "tansho_odds",
+            "単勝オッズ",
+        ):
+            if k in obj:
+                v = parse_float_maybe(obj.get(k, ""))
+                if v is not None and v > 0:
+                    odds_val = float(v)
+                    break
+
+        if odds_val is None and "odds" in obj:
+            ov = obj.get("odds")
+            if isinstance(ov, dict):
+                for k in ("win", "single", "tansho", "winOdds", "singleOdds"):
+                    if k in ov:
+                        v = parse_float_maybe(ov.get(k, ""))
+                        if v is not None and v > 0:
+                            odds_val = float(v)
+                            break
+            else:
+                key_text = " ".join(str(k).lower() for k in obj.keys())
+                if any(t in key_text for t in ("win", "single", "tansho", "単勝")):
+                    v = parse_float_maybe(ov)
+                    if v is not None and v > 0:
+                        odds_val = float(v)
+
+        if horse_no is not None and odds_val is not None and odds_val > 0:
+            prev = out.get(int(horse_no))
+            if prev is None or float(odds_val) < float(prev):
+                out[int(horse_no)] = float(odds_val)
+
+        for v in obj.values():
+            _extract_rakuten_odds_map_from_obj(v, out)
+        return
+
+    if isinstance(obj, list):
+        for it in obj:
+            _extract_rakuten_odds_map_from_obj(it, out)
+
+
+def parse_win_odds_rows_from_rakuten_html(html: str) -> List[Dict[str, Any]]:
+    """
+    楽天競馬ページHTMLから単勝オッズ行（馬番/単勝オッズ/人気）を抽出する。
+    """
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Next.js の __NEXT_DATA__ がある場合はそこから抽出
+    try:
+        script = soup.find("script", id="__NEXT_DATA__")
+        if script is not None:
+            raw = script.string or script.get_text(strip=True)
+            if raw:
+                data = json.loads(raw)
+                odds_map: Dict[int, float] = {}
+                _extract_rakuten_odds_map_from_obj(data, odds_map)
+                rows = compute_win_odds_rows_from_map(odds_map)
+                if rows:
+                    return rows
+    except Exception:
+        pass
+
+    # 2) フォールバック: 表行テキストから推定
+    rows_map: Dict[int, float] = {}
+    for tr in soup.find_all("tr"):
+        txt = unicodedata.normalize("NFKC", tr.get_text(" ", strip=True))
+        if not txt:
+            continue
+        if any(x in txt for x in ("取消", "除外", "中止")):
+            continue
+
+        nums = []
+        for m in re.finditer(r"\b([0-9]{1,2})\b", txt):
+            try:
+                n = int(m.group(1))
+            except Exception:
+                continue
+            if 1 <= n <= 30:
+                nums.append(n)
+        if not nums:
+            continue
+        horse_no = int(nums[0])
+
+        odds_candidates: List[float] = []
+        for m in re.finditer(r"\b([0-9]{1,4}\.[0-9]+)\b", txt):
+            v = parse_float_maybe(m.group(1))
+            if v is None:
+                continue
+            fv = float(v)
+            if 1.0 <= fv <= 9999.9:
+                odds_candidates.append(fv)
+        if not odds_candidates:
+            continue
+
+        odds_val = float(odds_candidates[0])
+        prev = rows_map.get(horse_no)
+        if prev is None or odds_val < prev:
+            rows_map[horse_no] = odds_val
+
+    return compute_win_odds_rows_from_map(rows_map)
+
+
+def parse_rakuten_venue_name_from_html(html: str) -> str:
+    """
+    楽天競馬ページHTML（主に __NEXT_DATA__）から馬場名を推定する。
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script is None:
+        return ""
+    try:
+        raw = script.string or script.get_text(strip=True)
+        if not raw:
+            return ""
+        data = json.loads(raw)
+        blob = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return ""
+
+    alias_to_name: List[Tuple[str, str]] = [
+        ("ばんえい十勝", "ばんえい帯広"),
+        ("帯広ばんえい", "ばんえい帯広"),
+        ("帯広競馬", "ばんえい帯広"),
+        ("帯広ば", "ばんえい帯広"),
+    ]
+    for alias, canonical in alias_to_name:
+        if alias in blob:
+            return canonical
+
+    # 既知の馬場名をそのまま探索
+    all_names = list(JRA_PLACE_BY_CODE.values()) + list(NAR_PLACE_BY_CODE.values())
+    all_names = sorted(set(str(x) for x in all_names if str(x)), key=lambda s: len(s), reverse=True)
+    for name in all_names:
+        if name in blob:
+            return str(name)
+    return ""
+
+
 def parse_place_code_from_race_id(race_id: str) -> Optional[int]:
     """
     race_id から「場所コード（2桁）」を取り出します。
@@ -355,6 +547,65 @@ NAR_PLACE_BY_CODE: Dict[int, str] = {
     55: "佐賀",
     65: "ばんえい帯広",
 }
+
+
+def infer_place_code_from_venue_name(venue_name: str) -> Optional[int]:
+    """
+    馬場名テキストから場所コードを推定する（楽天競馬URLなど race_id だけでは判定できない場合の補完）。
+    """
+    t = unicodedata.normalize("NFKC", str(venue_name or "")).strip()
+    if not t:
+        return None
+    compact = t.replace(" ", "").replace("　", "")
+
+    # まずは定義済みの正式名を優先
+    for code, name in {**JRA_PLACE_BY_CODE, **NAR_PLACE_BY_CODE}.items():
+        if str(name) and str(name) in compact:
+            return int(code)
+
+    # 表記ゆれ対応（必要なものだけ）
+    aliases: List[Tuple[str, int]] = [
+        ("帯広ばんえい", 65),
+        ("ばんえい十勝", 65),
+        ("帯広競馬", 65),
+        ("帯広ば", 65),
+        ("帯広", 65),
+    ]
+    for key, code in aliases:
+        if key in compact:
+            return int(code)
+    return None
+
+
+def infer_place_code_from_nonstandard_race_id(race_id: str) -> Optional[int]:
+    """
+    楽天の RACEID など非標準フォーマットから、既知コードをヒューリスティックに推定する。
+    """
+    rid = re.sub(r"[^0-9]", "", str(race_id or ""))
+    if not rid:
+        return None
+    known_codes = set(JRA_PLACE_BY_CODE.keys()) | set(NAR_PLACE_BY_CODE.keys())
+
+    candidates: List[str] = []
+    if len(rid) >= 4:
+        candidates.append(rid[-4:-2])  # 末尾RRの直前
+    if len(rid) >= 6:
+        candidates.append(rid[-6:-4])
+    if len(rid) >= 10:
+        candidates.append(rid[8:10])
+    if len(rid) >= 12:
+        candidates.append(rid[10:12])
+    if len(rid) >= 14:
+        candidates.append(rid[12:14])
+
+    for c in candidates:
+        try:
+            code = int(c)
+        except Exception:
+            continue
+        if code in known_codes:
+            return int(code)
+    return None
 
 
 def place_name_from_code(place_code: Optional[int]) -> str:
@@ -3547,12 +3798,8 @@ if st.session_state.get("_run_output"):
                 raise ValueError("オッズURLを入力してください。")
 
             status = st.status("処理中…（ジニ係数算出）", expanded=False)
-            race_id = ""
-            try:
-                qs = parse_qs(urlparse(odds_url).query)
-                race_id = str(qs.get("race_id", [""])[0] or "")
-            except Exception:
-                race_id = ""
+            race_id = extract_race_id_from_any_url(odds_url)
+            is_rakuten = is_rakuten_keiba_url(odds_url)
 
             race_ctx: Dict[str, Any] = {"race_id": race_id, "date": "", "venue": "", "race_no": None}
             runner_count: Optional[int] = None
@@ -3571,10 +3818,19 @@ if st.session_state.get("_run_output"):
                     html = fetch_html(odds_url)
                     race_ctx = parse_race_context_from_html(odds_url, html)
                     if not race_id:
-                        race_id = str(race_ctx.get("race_id", "") or "")
+                        race_id = str(race_ctx.get("race_id", "") or "") or extract_race_id_from_any_url(odds_url)
+                    if is_rakuten and not str(race_ctx.get("venue", "") or ""):
+                        race_ctx["venue"] = parse_rakuten_venue_name_from_html(html)
                     runner_count = parse_runner_count_from_result_html(html)
                 except Exception:
                     html = ""
+
+            if not win_rows and is_rakuten and html:
+                try:
+                    status.update(label="処理中…（楽天オッズ解析）", state="running")
+                    win_rows = parse_win_odds_rows_from_rakuten_html(html)
+                except Exception:
+                    win_rows = []
 
             if not win_rows and race_id:
                 try:
@@ -3594,11 +3850,13 @@ if st.session_state.get("_run_output"):
                     "race_id を含むURLを入力し、時間を置いて再試行してください（403/429時は取得不可）。"
                 )
 
-            if race_id and not str(race_ctx.get("venue", "") or ""):
-                place_code = parse_place_code_from_race_id(race_id)
+            place_code = parse_place_code_from_race_id(race_id)
+            if place_code is None:
+                place_code = infer_place_code_from_venue_name(str(race_ctx.get("venue", "") or ""))
+            if place_code is None:
+                place_code = infer_place_code_from_nonstandard_race_id(race_id)
+            if not str(race_ctx.get("venue", "") or "") and place_code is not None:
                 race_ctx["venue"] = place_name_from_code_any(place_code)
-            else:
-                place_code = parse_place_code_from_race_id(race_id)
 
             cnt = count_valid_win_rows(win_rows)
             if runner_count is None and cnt is not None:
