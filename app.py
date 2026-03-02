@@ -464,6 +464,96 @@ def parse_win_odds_rows_from_rakuten_html(html: str) -> List[Dict[str, Any]]:
     return compute_win_odds_rows_from_map(rows_map)
 
 
+def _extract_rakuten_horse_numbers_from_obj(obj: Any, out: set[int]) -> None:
+    if isinstance(obj, dict):
+        has_name = any(k in obj for k in ("horseName", "horse_name", "name", "umaName", "馬名"))
+        n: Optional[int] = None
+        for k in ("horseNo", "horseNumber", "horse_no", "umaban", "馬番"):
+            v = parse_int_maybe(obj.get(k, ""))
+            if v is not None and 1 <= int(v) <= 30:
+                n = int(v)
+                break
+        if n is not None and has_name:
+            out.add(int(n))
+        for v in obj.values():
+            _extract_rakuten_horse_numbers_from_obj(v, out)
+        return
+
+    if isinstance(obj, list):
+        for it in obj:
+            _extract_rakuten_horse_numbers_from_obj(it, out)
+
+
+def parse_rakuten_horse_numbers_from_table_html(html: str) -> List[int]:
+    """
+    楽天競馬の出馬表テーブルから出走馬番を抽出する。
+    競走馬詳細リンクを含む行だけを見るため、過去走の「xx頭」ノイズを回避しやすい。
+    """
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    nums: set[int] = set()
+    for tr in soup.find_all("tr"):
+        if tr.find("a", href=re.compile(r"/horse_detail/detail/HORSEID/\d+")) is None:
+            continue
+        txt = unicodedata.normalize("NFKC", tr.get_text(" ", strip=True))
+        if not txt:
+            continue
+        ints: List[int] = []
+        for m in re.finditer(r"\b([0-9]{1,2})\b", txt):
+            try:
+                n = int(m.group(1))
+            except Exception:
+                continue
+            if 1 <= n <= 30:
+                ints.append(n)
+            if len(ints) >= 3:
+                break
+        if not ints:
+            continue
+
+        horse_no = ints[0]
+        if len(ints) >= 2 and 1 <= ints[0] <= 8 and 1 <= ints[1] <= 30:
+            horse_no = ints[1]
+        if 1 <= horse_no <= 30:
+            nums.add(int(horse_no))
+    return sorted(nums)
+
+
+def parse_rakuten_horse_numbers_from_html(html: str) -> List[int]:
+    """
+    楽天競馬ページHTML（__NEXT_DATA__）から出走馬番一覧を抽出する。
+    """
+    if not html:
+        return []
+    table_nums = parse_rakuten_horse_numbers_from_table_html(html)
+    if table_nums:
+        return table_nums
+
+    soup = BeautifulSoup(html, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script is None:
+        return []
+    try:
+        raw = script.string or script.get_text(strip=True)
+        if not raw:
+            return []
+        data = json.loads(raw)
+    except Exception:
+        return []
+
+    nums: set[int] = set()
+    _extract_rakuten_horse_numbers_from_obj(data, nums)
+    return sorted(int(x) for x in nums if 1 <= int(x) <= 30)
+
+
+def parse_rakuten_runner_count_from_html(html: str) -> Optional[int]:
+    nums = parse_rakuten_horse_numbers_from_html(html)
+    if nums:
+        return int(len(nums))
+    return None
+
+
 def parse_rakuten_venue_name_from_html(html: str) -> str:
     """
     楽天競馬ページHTML（主に __NEXT_DATA__）から馬場名を推定する。
@@ -3873,7 +3963,10 @@ if st.session_state.get("_run_output"):
                         race_id = str(race_ctx.get("race_id", "") or "") or extract_race_id_from_any_url(odds_url)
                     if is_rakuten and not str(race_ctx.get("venue", "") or ""):
                         race_ctx["venue"] = parse_rakuten_venue_name_from_html(html)
-                    runner_count = parse_runner_count_from_result_html(html)
+                    if is_rakuten:
+                        runner_count = parse_rakuten_runner_count_from_html(html)
+                    if runner_count is None:
+                        runner_count = parse_runner_count_from_result_html(html)
                 except Exception:
                     html = ""
 
@@ -3881,6 +3974,14 @@ if st.session_state.get("_run_output"):
                 try:
                     status.update(label="処理中…（楽天オッズ解析）", state="running")
                     win_rows = parse_win_odds_rows_from_rakuten_html(html)
+                    horse_nums = parse_rakuten_horse_numbers_from_html(html)
+                    if horse_nums:
+                        allowed = set(int(x) for x in horse_nums)
+                        win_rows = [
+                            r
+                            for r in win_rows
+                            if isinstance(r, dict) and parse_int_maybe(r.get("馬番", "")) in allowed
+                        ]
                 except Exception:
                     win_rows = []
 
@@ -3915,7 +4016,13 @@ if st.session_state.get("_run_output"):
             cnt = count_valid_win_rows(win_rows)
             # ジニ係数モードでは、実際に取得できた単勝オッズ行数を出走頭数として優先する。
             # （HTML本文の「xx頭」は誤検出する場合があるため）
-            if cnt is not None:
+            if is_rakuten and html:
+                rc_rakuten = parse_rakuten_runner_count_from_html(html)
+                if rc_rakuten is not None:
+                    runner_count = int(rc_rakuten)
+                elif cnt is not None:
+                    runner_count = int(cnt)
+            elif cnt is not None:
                 runner_count = int(cnt)
 
             gini_row = compute_race_gini_from_win_rows(
