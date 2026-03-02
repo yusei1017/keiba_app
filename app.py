@@ -608,6 +608,58 @@ def infer_place_code_from_nonstandard_race_id(race_id: str) -> Optional[int]:
     return None
 
 
+def parse_place_code_from_rakuten_race_id(race_id: str) -> Optional[int]:
+    """
+    楽天競馬の RACEID から netkeiba系の場所コードへ変換する。
+    形式ゆれがあるため、複数候補を走査する。
+    """
+    rid = re.sub(r"[^0-9]", "", str(race_id or ""))
+    if len(rid) < 10:
+        return None
+
+    # 楽天側の場コード -> 本アプリで使う場所コード
+    rakuten_to_place: Dict[str, int] = {
+        "03": 65,  # 帯広ば
+        "04": 65,  # 帯広ば（形式差分）
+        "10": 35,  # 盛岡
+        "11": 36,  # 水沢
+        "18": 42,  # 浦和
+        "19": 43,  # 船橋
+        "20": 44,  # 大井
+        "21": 45,  # 川崎
+        "22": 46,  # 金沢
+        "23": 47,  # 笠松
+        "24": 48,  # 名古屋
+        "27": 50,  # 園田
+        "29": 54,  # 高知（形式差分）
+        "30": 51,  # 姫路
+        "31": 54,  # 高知
+        "32": 55,  # 佐賀
+        "33": 48,  # 名古屋（形式差分）
+        "35": 45,  # 川崎（形式差分）
+        "36": 30,  # 門別
+    }
+
+    # 202603022433240508 のような18桁、202503102000000007 のような18桁を想定
+    # YYYYMMDD の後ろに場コードが来ることが多いが、形式差分があるので複数位置を試す。
+    candidate_slices: List[Tuple[int, int]] = [
+        (8, 10),
+        (10, 12),
+        (12, 14),
+        (14, 16),
+        (len(rid) - 10, len(rid) - 8),
+        (len(rid) - 8, len(rid) - 6),
+    ]
+    for s, e in candidate_slices:
+        if s < 0 or e > len(rid) or s >= e:
+            continue
+        key = rid[s:e]
+        mapped = rakuten_to_place.get(key)
+        if mapped is not None:
+            return int(mapped)
+    return None
+
+
 def place_name_from_code(place_code: Optional[int]) -> str:
     if place_code is None:
         return ""
@@ -3804,7 +3856,7 @@ if st.session_state.get("_run_output"):
             race_ctx: Dict[str, Any] = {"race_id": race_id, "date": "", "venue": "", "race_no": None}
             runner_count: Optional[int] = None
             win_rows: List[Dict[str, Any]] = []
-            if race_id:
+            if race_id and (not is_rakuten):
                 try:
                     status.update(label=f"処理中…（単勝オッズ） race_id={race_id}", state="running")
                     win_rows = fetch_win_rows_for_race(race_id)
@@ -3851,6 +3903,8 @@ if st.session_state.get("_run_output"):
                 )
 
             place_code = parse_place_code_from_race_id(race_id)
+            if place_code is None and is_rakuten:
+                place_code = parse_place_code_from_rakuten_race_id(race_id)
             if place_code is None:
                 place_code = infer_place_code_from_venue_name(str(race_ctx.get("venue", "") or ""))
             if place_code is None:
@@ -3859,7 +3913,9 @@ if st.session_state.get("_run_output"):
                 race_ctx["venue"] = place_name_from_code_any(place_code)
 
             cnt = count_valid_win_rows(win_rows)
-            if runner_count is None and cnt is not None:
+            # ジニ係数モードでは、実際に取得できた単勝オッズ行数を出走頭数として優先する。
+            # （HTML本文の「xx頭」は誤検出する場合があるため）
+            if cnt is not None:
                 runner_count = int(cnt)
 
             gini_row = compute_race_gini_from_win_rows(
