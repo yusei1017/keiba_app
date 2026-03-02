@@ -140,3 +140,44 @@ def append_rows(
         .execute()
     )
     return json.loads(json.dumps(result))
+
+
+def update_range(
+    *,
+    spreadsheet_id: str,
+    sheet_name: str,
+    a1_range: str,
+    values: List[List[Any]],
+    service_account_info: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Google Sheets の指定範囲を上書き更新する（service account）。
+    """
+    if not values:
+        return None
+    try:
+        from google.oauth2.service_account import Credentials  # type: ignore
+        from googleapiclient.discovery import build  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise GoogleSheetsUnavailable(
+            "Google Sheets 連携に必要なライブラリがありません。"
+            " `pip install google-api-python-client google-auth` を入れてください。"
+        ) from e
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    safe_sheet = _sanitize_sheet_name(sheet_name)
+    body = {"values": values}
+    result = (
+        service.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{safe_sheet}!{a1_range}",
+            valueInputOption="USER_ENTERED",
+            body=body,
+        )
+        .execute()
+    )
+    return json.loads(json.dumps(result))

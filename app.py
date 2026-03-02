@@ -251,6 +251,9 @@ def parse_race_context_from_html(url: str, html: str) -> Dict[str, Any]:
         "川崎",
         "船橋",
         "浦和",
+        "ばんえい帯広",
+        "帯広ば",
+        "帯広",
         "門別",
         "盛岡",
         "水沢",
@@ -350,6 +353,7 @@ NAR_PLACE_BY_CODE: Dict[int, str] = {
     51: "姫路",
     54: "高知",
     55: "佐賀",
+    65: "ばんえい帯広",
 }
 
 
@@ -3586,6 +3590,8 @@ if st.session_state.get("_run_output"):
             if race_id and not str(race_ctx.get("venue", "") or ""):
                 place_code = parse_place_code_from_race_id(race_id)
                 race_ctx["venue"] = place_name_from_code_any(place_code)
+            else:
+                place_code = parse_place_code_from_race_id(race_id)
 
             cnt = count_valid_win_rows(win_rows)
             if runner_count is None and cnt is not None:
@@ -3635,6 +3641,43 @@ if st.session_state.get("_run_output"):
             col_g1.metric("ジニ係数", f'{float(gini_row["ジニ係数"]):.6f}')
             col_g2.metric("出走頭数", str(int(gini_row["出走頭数"])))
             col_g3.metric("ジニ対象頭数", str(int(gini_row["ジニ対象頭数"])))
+
+            # 毎回上書きで「予想!B1:B5」を更新する
+            can_write_pred = sheets_enabled and has_service_account_source(
+                sheets_sa_file, str(sheets_sa_path).strip()
+            ) and bool(sheets_spreadsheet_id.strip())
+            if sheets_enabled and not can_write_pred:
+                st.info("予想シート更新には Spreadsheet ID とサービスアカウントJSONを指定してください。")
+            if can_write_pred:
+                try:
+                    status.update(label="処理中…（Sheets更新: 予想!B1:B5）", state="running")
+                    sa_info = load_service_account_info(
+                        uploaded=sheets_sa_file, local_path=str(sheets_sa_path).strip()
+                    )
+                    google_sheets.ensure_sheet_exists(
+                        spreadsheet_id=str(sheets_spreadsheet_id).strip(),
+                        sheet_name="予想",
+                        service_account_info=sa_info,
+                    )
+                    x = float(gini_row["ジニ係数"])
+                    google_sheets.update_range(
+                        spreadsheet_id=str(sheets_spreadsheet_id).strip(),
+                        sheet_name="予想",
+                        a1_range="B1:B5",
+                        values=[
+                            [float(x - 0.01)],
+                            [float(x + 0.01)],
+                            ["" if place_code is None else int(place_code)],
+                            [int(gini_row["出走頭数"])],
+                            [int(gini_row["出走頭数"])],
+                        ],
+                        service_account_info=sa_info,
+                    )
+                    st.caption("予想シート更新: B1=x-0.01 / B2=x+0.01 / B3=馬場コード / B4=出走頭数 / B5=出走頭数")
+                except google_sheets.GoogleSheetsUnavailable as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"予想シート更新に失敗しました: {e}")
 
             st.subheader("ジニ対象馬（上位半分）")
             render_copy_button("ジニ対象馬をコピー(TSV)", rows_to_tsv(top_half_rows), key="gini_top_half_rows")
